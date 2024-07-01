@@ -1,22 +1,19 @@
 import os, random, math
-import copy
 import numpy as np
 from argparse import ArgumentParser
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
-from rdkit.Chem import Descriptors
-from rdkit import Chem
 from tqdm import trange
 
 from chemprop.parsing import add_train_args, modify_train_args
 from chemprop.models import MoleculeModel
 from chemprop.data import MoleculeDataset
 from chemprop.data.utils import get_data, split_data
-from chemprop.utils import build_optimizer, build_lr_scheduler, get_loss_func, get_metric_func, load_checkpoint, makedirs, save_checkpoint
+from chemprop.utils import build_optimizer, build_lr_scheduler, get_loss_func, get_metric_func, load_checkpoint, \
+    makedirs, save_checkpoint
 from chemprop.train import evaluate, evaluate_predictions, predict
 
 torch.backends.cudnn.benchmark = False
@@ -28,6 +25,7 @@ class WarmupLinearSchedule(LambdaLR):
         Linearly decreases learning rate from 1. to 0. over remaining `t_total - warmup_steps`
         steps.
     """
+
     def __init__(self, optimizer, warmup_steps, t_total, last_epoch=-1):
         self.warmup_steps = warmup_steps
         self.t_total = t_total
@@ -48,9 +46,9 @@ class DiseaseModel(nn.Module):
         self.encoder = MoleculeModel(classification=False, multiclass=False)
         self.encoder.create_encoder(args)
         self.encoder.ffn = nn.Sequential(
-                nn.Linear(args.hidden_size, args.hidden_size),
-                nn.ReLU(),
-                nn.Linear(args.hidden_size, args.latent_size)
+            nn.Linear(args.hidden_size, args.hidden_size),
+            nn.ReLU(),
+            nn.Linear(args.hidden_size, args.latent_size)
         )
         self.num_hiv_targets = args.num_hiv_targets
         self.num_covid_targets = args.num_covid_targets
@@ -82,120 +80,50 @@ class DiseaseModel(nn.Module):
         DTI_vecs = self.DTI_forward(smiles_batch, mode)
         return self.ffn[mode](DTI_vecs)
 
-    def combo_forward(self, smiles1, smiles2, mode):
-        DTI_vecs1 = self.DTI_forward(smiles1, mode)
-        DTI_vecs2 = self.DTI_forward(smiles2, mode)
-        DTI_vecs = DTI_vecs1 + DTI_vecs2 - DTI_vecs1 * DTI_vecs2
-        score1 = torch.sigmoid(self.ffn[mode](DTI_vecs1))
-        score2 = torch.sigmoid(self.ffn[mode](DTI_vecs2))
-        score = self.ffn[mode](DTI_vecs)
-        bliss = torch.log(score1 + score2 - score1 * score2)
-        score = score - bliss
-        return score
+    def pre_forward(self, smiles_batch, mode):
+        DTI_vecs = self.DTI_forward(smiles_batch, mode)
+        return DTI_vecs
 
 
 def prepare_data(args):
-    src_data = get_data(path=args.data_path, args=args)
     dti_data = get_data(path=args.dti_path, args=args)
-
-    args.use_compound_names = True
-    covid_data = get_data(path=args.covid_path, args=args)
-    src_combo = get_data(path=args.combo_path, args=args)
-    covid_combo_train = get_data(path=args.covid_combo_train, args=args)
-    covid_combo_test = get_data(path=args.covid_combo_test, args=args)
-    covid_combo_val = get_data(path=args.covid_combo_val, args=args)
-    args.use_compound_names = False
-    print("combo training set, before filtering duplicates", len(covid_combo_train))
-
-    # filter duplicates
-    test_set = set(zip(covid_combo_test.compound_names(), covid_combo_test.smiles()))
-    covid_combo_train = [d for d in covid_combo_train if (d.compound_name, d.smiles) not in test_set and (d.smiles, d.compound_name) not in test_set]
-    covid_combo_train = MoleculeDataset(covid_combo_train)
-    print("combo training set, after filtering duplicates", len(covid_combo_train))
-
     args.output_size = len(dti_data[0].targets)
     args.num_tasks = 1
-    args.train_data_size = len(covid_data)
-    
-    return dti_data, src_data, src_combo, covid_data, covid_combo_train, covid_combo_val, covid_combo_test
+    args.train_data_size = len(dti_data)
+
+    return dti_data
 
 
-def train(dti_data, src_data, src_combo, covid_data, covid_combo, model, optimizer, scheduler, loss_func, args):
+def train(dti_data, model, optimizer, scheduler, loss_func, args):
     model.train()
-    src_data.shuffle()
-    covid_data.shuffle()
     dti_data.shuffle()
 
-    for i in trange(0, len(covid_data), args.batch_size):
+    for i in trange(0, args.batch_size):
         model.zero_grad()
-        src_combo.shuffle()  # combo is small, reshuffle everytime
-        covid_combo.shuffle()  # combo is small, reshuffle everytime
-
-        src_batch = MoleculeDataset(src_data[i:i + args.batch_size])
-        covid_batch = MoleculeDataset(covid_data[i:i + args.batch_size])
         dti_batch = MoleculeDataset(dti_data[i:i + args.batch_size])
-        src_combo_batch = MoleculeDataset(src_combo[:args.batch_size])  # only take the first batch
-        covid_combo_batch = MoleculeDataset(covid_combo[:args.batch_size])  # only take the first batch
-        if len(covid_batch) < args.batch_size:
-            continue
-        
         # DTI batch
         smiles, targets = dti_batch.smiles(), dti_batch.targets()
-        mask = torch.Tensor([[x is not None for x in tb] for tb in targets]).cuda()
-        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets]).cuda()
+        mask = torch.Tensor([[x is not None for x in tb] for tb in targets])
+        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets])
         preds = model.encoder(smiles)[:, :targets.size(1)]
         dti_loss = loss_func(preds, targets)
+
         dti_loss = (dti_loss * mask).sum() / mask.sum()
-        smiles = targets = mask = None
-
-        smiles, targets = src_batch.smiles(), src_batch.targets()
-        mask = torch.Tensor([[x is not None for x in tb] for tb in targets]).cuda()
-        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets]).cuda()
-        preds = model(smiles, mode=1)
-        src_loss = loss_func(preds, targets)
-        src_loss = (src_loss * mask).sum() / mask.sum()
-        smiles = targets = mask = None
-
-        smiles, targets = covid_batch.smiles(), covid_batch.targets()
-        mask = torch.Tensor([[x is not None for x in tb] for tb in targets]).cuda()
-        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets]).cuda()
-        preds = model(smiles, mode=0)
-        covid_loss = loss_func(preds, targets)
-        covid_loss = (covid_loss * mask).sum() / mask.sum()
-        smiles = targets = mask = None
-
-        smiles1, smiles2 = src_combo_batch.compound_names(), src_combo_batch.smiles()
-        targets = src_combo_batch.targets()
-        mask = torch.Tensor([[x is not None for x in tb] for tb in targets]).cuda()
-        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets]).cuda()
-        preds = model.combo_forward(smiles1, smiles2, mode=1)
-        src_combo_loss = loss_func(preds, targets)
-        src_combo_loss = (src_combo_loss * mask).sum() / mask.sum()
-        smiles1 = smiles2 = targets = mask = None
-
-        smiles1, smiles2 = covid_combo_batch.compound_names(), covid_combo_batch.smiles()
-        targets = covid_combo_batch.targets()
-        mask = torch.Tensor([[x is not None for x in tb] for tb in targets]).cuda()
-        targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets]).cuda()
-        preds = model.combo_forward(smiles1, smiles2, mode=0)
-        covid_combo_loss = loss_func(preds, targets)
-        covid_combo_loss = (covid_combo_loss * mask).sum() / mask.sum()
-
-        loss = args.dti_lambda * dti_loss + args.single_lambda * (src_loss + covid_loss) + args.combo_lambda * (src_combo_loss + covid_combo_loss)
+        loss = args.dti_lambda * dti_loss
         loss.backward()
         optimizer.step()
         scheduler.step()
 
 
-def combo_evaluate(model, data, args):
+def combo_evaluate(model, dti_data, args):
     model.eval()
     all_preds, all_targets = [], []
 
-    for i in trange(0, len(data), args.batch_size):
-        mol_batch = MoleculeDataset(data[i:i + args.batch_size])
-        smiles1, smiles2 = mol_batch.compound_names(), mol_batch.smiles()
-        targets = mol_batch.targets()
-        preds = model.combo_forward(smiles1, smiles2, mode=0)
+    for i in trange(0, len(dti_data), args.batch_size):
+        dti_batch = MoleculeDataset(dti_data[i:i + args.batch_size])
+        targets = dti_batch.targets()
+        smiles = dti_batch.smiles()
+        preds = model.forward(smiles, mode=0)
         all_preds.extend(preds.tolist())
         all_targets.extend(targets)
 
@@ -208,31 +136,32 @@ def run_training(args, save_dir):
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    dti_data, src_data, src_combo, covid_data, covid_combo_train, covid_combo_val, covid_combo_test = prepare_data(args)
+    dti_data = prepare_data(args)
 
-    model = DiseaseModel(args).cuda()
+    model = DiseaseModel(args)
     loss_func = get_loss_func(args)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = WarmupLinearSchedule(optimizer, 
-            warmup_steps=args.train_data_size / args.batch_size * 2,
-            t_total=args.train_data_size / args.batch_size * args.epochs
-    )
+    scheduler = WarmupLinearSchedule(optimizer,
+                                     warmup_steps=args.train_data_size / args.batch_size * 2,
+                                     t_total=args.train_data_size / args.batch_size * args.epochs
+                                     )
 
     args.metric_func = get_metric_func(metric=args.metric)
     best_score = float('inf') if args.minimize_score else -float('inf')
     best_epoch = 0
 
-    for epoch in range(10):
+    for epoch in range(1):
         print(f'Epoch {epoch}')
-        train(dti_data, src_data, src_combo, covid_data, covid_combo_train, model, optimizer, scheduler, loss_func, args)
+        train(dti_data, model, optimizer, scheduler, loss_func, args)
 
-        val_scores = combo_evaluate(model, covid_combo_val, args)
+        val_scores = combo_evaluate(model, dti_data, args)
         avg_val_score = np.nanmean(val_scores)
         print(f'Combo Validation {args.metric} = {avg_val_score:.4f}')
-        
+
         # only save checkpoints when DTI prediction is accurate enough (after five epochs)
-        if epoch >= 5 and (args.minimize_score and avg_val_score < best_score or not args.minimize_score and avg_val_score > best_score):
+        if epoch >= 0 and (
+                args.minimize_score and avg_val_score < best_score or not args.minimize_score and avg_val_score > best_score):
             best_score, best_epoch = avg_val_score, epoch
             save_checkpoint(os.path.join(save_dir, 'model.pt'), model, args=args)
 
@@ -240,7 +169,7 @@ def run_training(args, save_dir):
     ckpt_path = os.path.join(save_dir, 'model.pt')
     model.load_state_dict(torch.load(ckpt_path)['state_dict'])
 
-    test_scores = combo_evaluate(model, covid_combo_test, args)
+    test_scores = combo_evaluate(model, dti_data, args)
     avg_test_scores = np.nanmean(test_scores)
     print(f'Test {args.metric} = {avg_test_scores:.4f}')
 
@@ -250,13 +179,7 @@ def run_training(args, save_dir):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument('--dti_path', default="data/covid/dti.csv")
-    parser.add_argument('--combo_path', default="data/hiv/synergy_bliss.csv")
-    parser.add_argument('--covid_path', default="data/covid/single_agent.csv")
-    parser.add_argument('--covid_combo_train', default="data/covid/synergy_train.csv")
-    parser.add_argument('--covid_combo_test', default="data/covid/synergy_test.csv")
-    parser.add_argument('--covid_combo_val', default="data/covid/synergy_valid.csv")
     parser.add_argument('--single_lambda', type=float, default=0.1)
-    parser.add_argument('--combo_lambda', type=float, default=1)
     parser.add_argument('--dti_lambda', type=float, default=10)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--latent_size', type=int, default=100)
@@ -267,7 +190,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.data_path = 'data/hiv/hiv.csv'
     args.dataset_type = 'classification'
-    args.num_folds = 5
+    args.num_folds = 1
+    args.save_dir = 'data'
 
     modify_train_args(args)
     print(args)
