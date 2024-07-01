@@ -1,22 +1,21 @@
 import os, random, sys
+import time
+
 import numpy as np
 from argparse import ArgumentParser
 
+import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
+from chemprop.data.utils import get_data
 from covid_train import DiseaseModel
-from sklearn.metrics import roc_auc_score, classification_report
 
 
-def combo_evaluate(model, data, args):
+def combo_evaluate(model, dti_data, args):
     model.eval()
     all_preds = []
-    for i in range(0, len(data), args.batch_size):
-        mol_batch = data[i : i + args.batch_size]
-        smiles1, smiles2 = list(zip(*mol_batch))[:2]
-        preds = model.combo_forward(smiles1, smiles2, mode=0).cpu().numpy()
+    for i in range(5):  # len(dti_data)
+        preds = model.pre_forward([dti_data.data[i].smiles], mode=0)
         all_preds.append(preds)
     return np.concatenate(all_preds, axis=0)
 
@@ -24,13 +23,11 @@ def combo_evaluate(model, data, args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=50)
-    parser.add_argument('--test_path', required=True)
-    parser.add_argument('--checkpoint_dir', required=True)
+    parser.add_argument('--test_path', default=r"D:\users\p30057372\ComboNet\ComboNet-master\data\covid\dti.csv")
+    parser.add_argument('--checkpoint_dir', default=r"D:\users\p30057372\ComboNet\ComboNet-master\data\fold_0")
     args = parser.parse_args()
 
-    with open(args.test_path) as f:
-        header = next(f)
-        data = [line.strip("\r\n ").split(',')[:2] for line in f]
+    data = get_data(path=args.test_path)
 
     args.checkpoint_paths = []
     for root, _, files in os.walk(args.checkpoint_dir):
@@ -40,16 +37,14 @@ if __name__ == "__main__":
 
     sum_preds = np.zeros((len(data),))
     with torch.no_grad():
+        pred_output = pd.DataFrame()
         for checkpoint_path in args.checkpoint_paths:
             ckpt = torch.load(checkpoint_path)
             ckpt['args'].attention = False
-            model = DiseaseModel(ckpt['args']).cuda()
+            model = DiseaseModel(ckpt['args'])
             model.load_state_dict(ckpt['state_dict'])
             model_preds = combo_evaluate(model, data, ckpt['args'])
-            sum_preds += np.array(model_preds)[:, 0]
-
-    sum_preds += 10
-    print("row_smiles,col_smiles,score")
-    for (x, y), score in zip(data, sum_preds):
-        print(f"{x},{y},{score:.6f}")
-
+            df = pd.DataFrame(model_preds)
+            pred_output = pd.concat([pred_output, df], ignore_index=True)
+        pred_output.to_csv(r"D:\users\p30057372\ComboNet\ComboNet-master\data\测试结果{now}.csv".format(
+            now=time.strftime("%Y-%m-%d-%H_%M_%S", time.localtime(time.time()))))
