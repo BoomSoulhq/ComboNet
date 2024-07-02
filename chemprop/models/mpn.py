@@ -44,8 +44,8 @@ class MPNEncoder(nn.Module):
         self.act_func = get_activation_function(args.activation)
 
         # Cached zeros
-        #self.cached_zero_vector = nn.Parameter(torch.zeros(self.hidden_size), requires_grad=False)
-        self.cached_zero_vector = torch.zeros(self.hidden_size).cuda()
+        self.cached_zero_vector = nn.Parameter(torch.zeros(self.hidden_size), requires_grad=False)
+        #self.cached_zero_vector = torch.zeros(self.hidden_size).cuda()
 
         # Input
         input_dim = self.atom_fdim if self.atom_messages else self.bond_fdim
@@ -83,7 +83,7 @@ class MPNEncoder(nn.Module):
             features_batch = torch.from_numpy(np.stack(features_batch)).float()
 
             if self.args.cuda:
-                features_batch = features_batch.cuda()
+                features_batch = features_batch
 
             if self.features_only:
                 return features_batch
