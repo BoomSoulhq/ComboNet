@@ -64,7 +64,10 @@ class MoleculeDatapoint:
             self.features = np.where(np.isnan(self.features), replace_token, self.features)
 
         # Create targets
-        self.targets = [float(x) if x != '' else None for x in line[1:]]
+        self.targets = [float(x) if x != '' else None for x in line[1:-1]]
+
+        # Create label
+        self.label = int(line[-1])
 
     def set_features(self, features: np.ndarray):
         """
@@ -89,6 +92,15 @@ class MoleculeDatapoint:
         :param targets: A list of floats containing the targets.
         """
         self.targets = targets
+
+    def set_label(self, label: int):
+        """
+        Sets the label of a molecule.
+
+        :param label:  the label.
+        """
+        self.label = label
+
 
 
 class MoleculeDataset(Dataset):
