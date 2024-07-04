@@ -50,11 +50,12 @@ class DiseaseModel(nn.Module):
             nn.ReLU(),
             nn.Linear(args.hidden_size, args.latent_size)
         )
-        self.num_hiv_targets = args.num_hiv_targets
         self.num_covid_targets = args.num_covid_targets
-        self.covid_ffn = nn.Linear(args.latent_size - args.num_hiv_targets, args.num_tasks)
-        self.hiv_ffn = nn.Linear(args.latent_size - args.num_covid_targets, args.num_tasks)
-        self.ffn = [self.covid_ffn, self.hiv_ffn]
+        self.covid_ffn = nn.Sequential(
+            nn.Linear(args.latent_size, args.num_tasks),
+            nn.Sigmoid()
+        )
+        self.ffn = self.covid_ffn
 
         for param in self.parameters():
             if param.dim() == 1:
@@ -66,23 +67,21 @@ class DiseaseModel(nn.Module):
     # DTI_vecs = [covid_targets, hiv_targets, latent_targets]
     # covid_vecs = [covid_targets, latent_targets]
     # hiv_vecs = [hiv_targets, latent_targets]
-    def DTI_forward(self, smiles_batch, mode):
+    def DTI_forward(self, smiles_batch):
         DTI_vecs = self.encoder(smiles_batch)
         DTI_vecs = torch.sigmoid(DTI_vecs)
-        covid_vecs = DTI_vecs[:, :self.num_covid_targets]
-        normal_vecs = DTI_vecs[:, self.num_covid_targets + self.num_hiv_targets:]
-        covid_vecs = torch.cat([covid_vecs, normal_vecs], dim=-1)
-        hiv_vecs = DTI_vecs[:, self.num_covid_targets:]
-        DTI_splitted = [covid_vecs, hiv_vecs]  # covid is zero
-        return DTI_splitted[mode]
-
-    def forward(self, smiles_batch, mode):
-        DTI_vecs = self.DTI_forward(smiles_batch, mode)
-        return self.ffn[mode](DTI_vecs)
-
-    def pre_forward(self, smiles_batch, mode):
-        DTI_vecs = self.DTI_forward(smiles_batch, mode)
         return DTI_vecs
+
+    def forward(self, smiles_batch):
+        DTI_vecs = self.DTI_forward(smiles_batch)
+        #DTI_vecs = nn.Sigmoid(DTI_vecs)
+        return self.ffn(DTI_vecs)
+
+    def pre_forward(self, smiles_batch):
+        DTI_vecs = self.DTI_forward(smiles_batch)
+        DTI_vecs = self.ffn(DTI_vecs)
+        DTI_vecs = torch.where(DTI_vecs > 0.5, torch.tensor(1), torch.tensor(0))
+        return torch.cat((torch.sigmoid(self.ffn[0].weight), DTI_vecs), dim=1)
 
 
 def prepare_data(args):
@@ -98,18 +97,27 @@ def train(dti_data, model, optimizer, scheduler, loss_func, args):
     model.train()
     dti_data.shuffle()
 
-    for i in trange(0, args.batch_size):
+    for i in trange(0, len(dti_data),args.batch_size):
         model.zero_grad()
         dti_batch = MoleculeDataset(dti_data[i:i + args.batch_size])
+
+        if len(dti_data) < args.batch_size:
+            continue
         # DTI batch
         smiles, targets = dti_batch.smiles(), dti_batch.targets()
         mask = torch.Tensor([[x is not None for x in tb] for tb in targets])
         targets = torch.Tensor([[0 if x is None else x for x in tb] for tb in targets])
+
         preds = model.encoder(smiles)[:, :targets.size(1)]
         dti_loss = loss_func(preds, targets)
-
         dti_loss = (dti_loss * mask).sum() / mask.sum()
-        loss = args.dti_lambda * dti_loss
+
+        labels = torch.Tensor([[dti_batch.data[i].label] for i in range(len(dti_batch.data))])
+        preds = model(smiles)
+        output_loss = loss_func(preds, labels)
+        output_loss = (output_loss * mask).sum() / mask.sum()
+
+        loss = args.dti_lambda * dti_loss + args.single_lambda * output_loss
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -117,17 +125,23 @@ def train(dti_data, model, optimizer, scheduler, loss_func, args):
 
 def combo_evaluate(model, dti_data, args):
     model.eval()
-    all_preds, all_targets = [], []
+    all_preds, all_labels = [], []
 
     for i in trange(0, len(dti_data), args.batch_size):
-        dti_batch = MoleculeDataset(dti_data[i:i + args.batch_size])
-        targets = dti_batch.targets()
+        if(i+ args.batch_size>=len(dti_data)):
+            dti_batch = MoleculeDataset(dti_data[max(0,len(dti_data)-args.batch_size):len(dti_data)])
+        else:
+            dti_batch = MoleculeDataset(dti_data[i:i + args.batch_size])
+        labels = torch.Tensor([[dti_batch.data[i].label] for i in range(len(dti_batch.data))])
         smiles = dti_batch.smiles()
-        preds = model.forward(smiles, mode=0)
-        all_preds.extend(preds.tolist())
-        all_targets.extend(targets)
-
-    score = evaluate_predictions(all_preds, all_targets, args.num_tasks, args.metric_func, args.dataset_type)
+        preds = model(smiles)
+        preds = torch.where(preds > args.binary_threshold, torch.tensor(1.0, requires_grad=True), torch.tensor(0.0, requires_grad=True))
+        all_preds.append(preds.tolist())
+        all_labels.append(labels.tolist())
+    score = []
+    for i in range(len(all_preds)):
+        cur_score = nn.functional.cross_entropy(torch.flatten(torch.tensor(all_preds[i])), torch.flatten(torch.tensor(all_labels[i])))
+        score.append(cur_score)
     return score
 
 
@@ -178,13 +192,13 @@ def run_training(args, save_dir):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument('--dti_path', default="data/covid/dti.csv")
+    parser.add_argument('--dti_path', default="data/covid/dti_test.csv")
     parser.add_argument('--single_lambda', type=float, default=0.1)
     parser.add_argument('--dti_lambda', type=float, default=10)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--latent_size', type=int, default=100)
-    parser.add_argument('--num_hiv_targets', type=int, default=7)
     parser.add_argument('--num_covid_targets', type=int, default=35)
+    parser.add_argument('--binary_threshold', type=float, default=0.5)
 
     add_train_args(parser)
     args = parser.parse_args()
