@@ -44,8 +44,8 @@ class MPNEncoder(nn.Module):
         self.act_func = get_activation_function(args.activation)
 
         # Cached zeros
-        self.cached_zero_vector = nn.Parameter(torch.zeros(self.hidden_size), requires_grad=False)
-        #self.cached_zero_vector = torch.zeros(self.hidden_size).cuda()
+        #self.cached_zero_vector = nn.Parameter(torch.zeros(self.hidden_size), requires_grad=False)
+        self.cached_zero_vector = torch.zeros(self.hidden_size)
 
         # Input
         input_dim = self.atom_fdim if self.atom_messages else self.bond_fdim
@@ -82,8 +82,6 @@ class MPNEncoder(nn.Module):
         if self.use_input_features:
             features_batch = torch.from_numpy(np.stack(features_batch)).float()
 
-            if self.args.cuda:
-                features_batch = features_batch
 
             if self.features_only:
                 return features_batch
@@ -93,11 +91,6 @@ class MPNEncoder(nn.Module):
         if self.atom_messages:
             a2a = mol_graph.get_a2a()
 
-        if self.args.cuda:
-            f_atoms, f_bonds, a2b, b2a, b2revb = f_atoms.cuda(), f_bonds.cuda(), a2b.cuda(), b2a.cuda(), b2revb.cuda()
-
-            if self.atom_messages:
-                a2a = a2a.cuda()
 
         # Input
         if self.atom_messages:
